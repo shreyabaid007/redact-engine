@@ -1,61 +1,31 @@
-# test_integration.py
+# test_performance.py
+import time
 import pytest
-import os
-import cv2
 import numpy as np
-from main import process_image, parse_args
-
-class TestIntegration:
-    @pytest.fixture
-    def setup_test_files(self):
-        # Create test image
-        test_image = np.zeros((100, 100, 3), dtype=np.uint8)
-        cv2.imwrite('test_input.jpg', test_image)
-
-        # Create dummy model file
-        torch.jit.script(torch.nn.Linear(10, 10)).save('test_model.pt')
-
-        yield
-
-        # Cleanup
-        os.remove('test_input.jpg')
-        os.remove('test_model.pt')
-        if os.path.exists('test_output.jpg'):
-            os.remove('test_output.jpg')
-
-    def test_full_image_processing(self, setup_test_files):
-        test_args = parse_args(['--input_image_path', 'test_input.jpg',
-                                '--output_image_path', 'test_output.jpg',
-                                '--face_model_path', 'test_model.pt'])
-
-        process_image(test_args)
-        assert os.path.exists('test_output.jpg')
+from main import get_image_tensor, visualize
 
 
-# @pytest.fixture
-# def sample_image():
-#     return np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-#
-# @pytest.fixture
-# def mock_model():
-#     class MockModel(torch.nn.Module):
-#         def forward(self, x):
-#             return (
-#                 torch.tensor([[0, 0, 10, 10], [20, 20, 30, 30]]),
-#                 None,
-#                 torch.tensor([0.95, 0.85]),
-#                 None
-#             )
-#     return MockModel()
-#
-# def test_image_tensor_conversion(sample_image):
-#     tensor = get_image_tensor(sample_image)
-#     assert isinstance(tensor, torch.Tensor)
-#     assert tensor.dim() == 3
-#     assert tensor.shape == (3, 100, 100)
-#
-# def test_get_detections(mock_model, sample_image):
-#     image_tensor = get_image_tensor(sample_image)
-#     detections = get_detections(mock_model, image_tensor, 0.8, 0.3)
-#     assert len(detections) > 0
-#     assert all(len(box) == 4 for box in detections)
+def test_image_tensor_conversion_performance():
+    image = np.random.randint(0, 255, (1080, 1920, 3), dtype=np.uint8)
+
+    start_time = time.time()
+    for _ in range(100):
+        tensor = get_image_tensor(image)
+    end_time = time.time()
+
+    average_time = (end_time - start_time) / 100
+    assert average_time < 0.1  # Should take less than 0.1 seconds per conversion
+
+
+@pytest.mark.parametrize("image_size", [(480, 640), (720, 1280), (1080, 1920)])
+def test_visualize_performance_scaling(image_size):
+    image = np.random.randint(0, 255, (*image_size, 3), dtype=np.uint8)
+    boxes = [[0, 0, 100, 100]] * 10
+
+    start_time = time.time()
+    result = visualize(image, boxes, 1.0)
+    processing_time = time.time() - start_time
+
+    # Processing time should scale roughly linearly with image size
+    max_allowed_time = (image_size[0] * image_size[1]) / (480 * 640) * 0.1
+    assert processing_time < max_allowed_time
