@@ -1,31 +1,23 @@
-# test_performance.py
-import time
-import pytest
+# test_properties.py
+from hypothesis import given, strategies as st
 import numpy as np
-from main import get_image_tensor, visualize
+from main import scale_box, visualize
 
+@given(st.lists(st.floats(min_value=0, max_value=100), min_size=4, max_size=4),
+       st.integers(min_value=50, max_value=1000),
+       st.integers(min_value=50, max_value=1000),
+       st.floats(min_value=0.1, max_value=5.0))
+def test_scale_box_properties(box, width, height, scale):
+    scaled = scale_box(box, width, height, scale)
+    assert len(scaled) == 4
+    assert all(0 <= x <= width for x in [scaled[0], scaled[2]])
+    assert all(0 <= y <= height for y in [scaled[1], scaled[3]])
 
-def test_image_tensor_conversion_performance():
-    image = np.random.randint(0, 255, (1080, 1920, 3), dtype=np.uint8)
-
-    start_time = time.time()
-    for _ in range(100):
-        tensor = get_image_tensor(image)
-    end_time = time.time()
-
-    average_time = (end_time - start_time) / 100
-    assert average_time < 0.1  # Should take less than 0.1 seconds per conversion
-
-
-@pytest.mark.parametrize("image_size", [(480, 640), (720, 1280), (1080, 1920)])
-def test_visualize_performance_scaling(image_size):
-    image = np.random.randint(0, 255, (*image_size, 3), dtype=np.uint8)
-    boxes = [[0, 0, 100, 100]] * 10
-
-    start_time = time.time()
+@given(st.integers(min_value=10, max_value=100),
+       st.integers(min_value=10, max_value=100))
+def test_visualize_properties(width, height):
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    boxes = [[0, 0, width//2, height//2]]
     result = visualize(image, boxes, 1.0)
-    processing_time = time.time() - start_time
-
-    # Processing time should scale roughly linearly with image size
-    max_allowed_time = (image_size[0] * image_size[1]) / (480 * 640) * 0.1
-    assert processing_time < max_allowed_time
+    assert result.shape == image.shape
+    assert result.dtype == image.dtype
