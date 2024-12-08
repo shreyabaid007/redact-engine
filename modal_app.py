@@ -1,67 +1,99 @@
-# Import statements and unchanged parts of the code remain the same
 import os
-from fastapi.responses import JSONResponse
-from pathlib import Path
+import logging
+import json
+import hmac
+import hashlib
+import asyncio
+from typing import Dict, Optional, Tuple
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseSettings, HttpUrl, validator
+from cryptography.fernet import Fernet
+import httpx
+
+# Configure logging without sensitive data
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+
+class SecuritySettings(BaseSettings):
+    """Application security settings"""
+    MAX_VIDEO_DURATION: int = 300  # 5 minutes
+    CLEANUP_INTERVAL: int = 86400  # 24 hours
+    MAX_RETRIES: int = 3
+    INITIAL_RETRY_DELAY: int = 1
+    MIN_KEY_LENGTH: int = 32
+
+    @validator('MAX_VIDEO_DURATION')
+    def validate_max_duration(cls, v):
+        if v <= 0 or v > 3600:  # Max 1 hour
+            raise ValueError("Invalid video duration limit")
+        return v
+
+    class Config:
+        env_prefix = "APP_"
+        env_file = ".env"
+
+
+settings = SecuritySettings()
+
 
 class VideoEncryption:
+    """Handles video encryption and decryption"""
+
     def __init__(self, key: Optional[bytes] = None):
-        if not key:
-            raise ValueError("Encryption key is required")
+        if not key or len(key) < settings.MIN_KEY_LENGTH:
+            raise ValueError("Invalid encryption key length")
+
         try:
             self.key = key if isinstance(key, bytes) else key.encode()
             self.cipher_suite = Fernet(self.key)
         except Exception as e:
-            raise ValueError("Invalid encryption key") from e
+            logger.error("Encryption initialization failed")
+            raise ValueError("Invalid encryption configuration")
 
     def encrypt_video(self, video_data: bytes) -> bytes:
-        """Encrypts video data."""
+        """Encrypts video data using Fernet"""
         try:
             return self.cipher_suite.encrypt(video_data)
         except Exception as e:
-            raise RuntimeError("Encryption failed") from e
+            logger.error("Video encryption failed")
+            raise RuntimeError("Encryption error")
 
     def decrypt_video(self, encrypted_data: bytes) -> bytes:
-        """Decrypts encrypted video data."""
+        """Decrypts encrypted video data"""
         try:
             return self.cipher_suite.decrypt(encrypted_data)
         except Exception as e:
-            raise RuntimeError("Decryption failed") from e
+            logger.error("Video decryption failed")
+            raise RuntimeError("Decryption error")
 
 
-# Updated Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-# Secure Environment Check for Webhook Secret
-class Settings(BaseSettings):
-    MAX_VIDEO_DURATION: int = 300  # 5 minutes max video duration
-    CLEANUP_INTERVAL: int = 86400  # 24 hours
-    MAX_RETRIES: int = 3
-    INITIAL_RETRY_DELAY: int = 1
-
-    class Config:
-        env_prefix = "MODAL_"
-
-
-settings = Settings()
-
-
-# Webhook Notification with Minimal Data in Logs
-async def notify_completion(callback_url: str, result: Dict):
-    """Securely notifies the callback URL with the processing result."""
-    if not callback_url or not callback_url.startswith(('http://', 'https://')):
-        logger.error("Invalid callback URL provided")
-        return
-
-    secret = os.environ.get("WEBHOOK_SECRET")
-    if not secret:
-        logger.error("Webhook secret not configured")
-        return
+async def notify_webhook(
+        callback_url: HttpUrl,
+        result: Dict,
+        webhook_secret: str
+) -> bool:
+    """
+    Sends webhook notification with signed payload
+    Returns: bool indicating success/failure
+    """
+    if not webhook_secret:
+        logger.error("Missing webhook configuration")
+        return False
 
     try:
-        serialized_payload = json.dumps(result, sort_keys=True, separators=(',', ':'))
-        signature = hmac.new(secret.encode(), serialized_payload.encode(), hashlib.sha256).hexdigest()
+        # Create signed payload
+        payload = json.dumps(result, sort_keys=True)
+        signature = hmac.new(
+            webhook_secret.encode(),
+            payload.encode(),
+            hashlib.sha256
+        ).hexdigest()
 
         headers = {
             "X-Webhook-Signature": signature,
@@ -71,38 +103,61 @@ async def notify_completion(callback_url: str, result: Dict):
         async with httpx.AsyncClient() as client:
             for attempt in range(settings.MAX_RETRIES):
                 try:
-                    response = await client.post(callback_url, json=result, headers=headers, timeout=10.0)
+                    response = await client.post(
+                        str(callback_url),
+                        json=result,
+                        headers=headers,
+                        timeout=10.0
+                    )
                     if response.status_code < 400:
-                        logger.info("Webhook notification sent successfully")
-                        return
-                    logger.warning(f"Webhook attempt {attempt + 1} failed with status {response.status_code}")
+                        logger.info("Webhook notification successful")
+                        return True
+
+                    logger.warning(f"Webhook attempt {attempt + 1} failed")
+
                 except Exception as e:
-                    logger.error(f"Webhook attempt {attempt + 1} failed: {str(e)}")
+                    logger.error("Webhook request failed")
                     if attempt < settings.MAX_RETRIES - 1:
                         await asyncio.sleep(2 ** attempt)
+
+        return False
+
     except Exception as e:
-        logger.error("Failed to send webhook notification")
+        logger.error("Webhook notification failed")
+        return False
 
 
-# Get Video API Endpoint
-@web_app.get("/video/{video_id}")
-async def get_video(video_id: str):
-    """Securely retrieves the encrypted video by ID."""
-    model = EgoBlurModel()
+app = FastAPI()
 
+
+@app.get("/video/{video_id}")
+async def get_video(video_id: str) -> StreamingResponse:
+    """
+    Retrieves and streams processed video
+
+    Args:
+        video_id: Unique video identifier
+
+    Returns:
+        StreamingResponse with video data
+
+    Raises:
+        HTTPException: For invalid requests or server errors
+    """
     try:
-        result = await model.get_video.remote.aio(video_id)
+        # Validate video_id
+        if not video_id or not video_id.isalnum():
+            raise HTTPException(status_code=400, detail="Invalid video ID")
 
-        if isinstance(result, JSONResponse):
-            return result
-
-        video_data, safe_video_id, file_size = result
+        # Get video data (implement your video retrieval logic)
+        video_data = await retrieve_video(video_id)
 
         if not video_data:
-            return JSONResponse(status_code=404, content={"error": "Video not found"})
+            raise HTTPException(status_code=404, detail="Video not found")
 
+        # Stream video in chunks
         async def video_stream():
-            chunk_size = 8192  # 8 KB chunks
+            chunk_size = 8192  # 8KB chunks
             for i in range(0, len(video_data), chunk_size):
                 yield video_data[i:i + chunk_size]
 
@@ -110,12 +165,21 @@ async def get_video(video_id: str):
             video_stream(),
             media_type="video/mp4",
             headers={
-                "Content-Disposition": f"attachment; filename=processed_{safe_video_id}.mp4",
-                "Content-Length": str(file_size),
-                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Content-Disposition": f"attachment; filename=video_{video_id}.mp4",
+                "Cache-Control": "no-store, must-revalidate",
                 "Pragma": "no-cache",
-            },
+            }
         )
+
     except Exception as e:
-        logger.error("Error retrieving video", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "Server error"})
+        logger.error(f"Error retrieving video: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# Implement your video retrieval logic
+async def retrieve_video(video_id: str) -> Optional[bytes]:
+    """
+    Implement your video retrieval logic here
+    Returns video data or None if not found
+    """
+    pass
