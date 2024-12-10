@@ -35,7 +35,7 @@ class SecuritySettings(BaseSettings):
         return v
 
     class Config:
-        env_prefix = "APP_"
+        env_prefix = "abc_"
         env_file = ".env"
 
 
@@ -76,13 +76,13 @@ class VideoEncryption:
 async def notify_webhook(
         callback_url: HttpUrl,
         result: Dict,
-        webhook_secret: str
+        app_secret: str
 ) -> bool:
     """
     Sends webhook notification with signed payload
     Returns: bool indicating success/failure
     """
-    if not webhook_secret:
+    if not app_secret:
         logger.error("Missing webhook configuration")
         return False
 
@@ -90,7 +90,7 @@ async def notify_webhook(
         # Create signed payload
         payload = json.dumps(result, sort_keys=True)
         signature = hmac.new(
-            webhook_secret.encode(),
+            app_secret.encode(),
             payload.encode(),
             hashlib.sha256
         ).hexdigest()
