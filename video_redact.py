@@ -59,18 +59,14 @@ def create_directory_if_not_exists(file_path: str) -> None:
 
 def validate_inputs(args: argparse.Namespace) -> argparse.Namespace:
     """Validate input arguments and ensure all required files and directories exist."""
-    if args.face_model_path and not os.path.exists(args.face_model_path):
-        raise FileNotFoundError(f"Face model file not found: {args.face_model_path}")
-    if args.lp_model_path and not os.path.exists(args.lp_model_path):
-        raise FileNotFoundError(f"License plate model file not found: {args.lp_model_path}")
-    if args.input_image_path and not os.path.exists(args.input_image_path):
-        raise FileNotFoundError(f"Input image file not found: {args.input_image_path}")
-    if args.input_video_path and not os.path.exists(args.input_video_path):
-        raise FileNotFoundError(f"Input video file not found: {args.input_video_path}")
-    if args.output_image_path:
-        create_directory_if_not_exists(args.output_image_path)
-    if args.output_video_path:
-        create_directory_if_not_exists(args.output_video_path)
+    for path_attr in ["face_model_path", "lp_model_path", "input_image_path", "input_video_path"]:
+        path = getattr(args, path_attr, None)
+        if path and not os.path.exists(path):
+            raise FileNotFoundError(f"File not found: {path}")
+    for output_attr in ["output_image_path", "output_video_path"]:
+        output_path = getattr(args, output_attr, None)
+        if output_path:
+            create_directory_if_not_exists(output_path)
     return args
 
 
@@ -83,9 +79,12 @@ def get_device() -> str:
 def load_model(model_path: Optional[str]) -> Optional[torch.jit.ScriptModule]:
     """Load and return a TorchScript model from the given path, if provided."""
     if model_path:
-        model = torch.jit.load(model_path, map_location=get_device())
-        model.eval()
-        return model
+        try:
+            model = torch.jit.load(model_path, map_location=get_device())
+            model.eval()
+            return model
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model from {model_path}: {e}")
     return None
 
 
@@ -110,8 +109,22 @@ def get_detections(
     return filtered_boxes.cpu().numpy().tolist()
 
 
-def visualize(image: np.ndarray, detections: List[List[float]], scale_factor: float) -> np.ndarray:
-    """Draw detection results on the image."""
+def visualize(
+        image: np.ndarray,
+        detections: List[List[float]],
+        scale_factor: float,
+        anonymization_type: str = "pixelation"
+) -> np.ndarray:
+    """
+    Draw detection results on the image using different anonymization methods.
+
+    Parameters:
+        image (np.ndarray): The input image.
+        detections (List[List[float]]): List of detected bounding boxes.
+        scale_factor (float): Scaling factor for bounding boxes.
+        anonymization_type (str): The type of anonymization to apply.
+                                  Options: "pixelation", "blurring", "blackout", "mosaic", "solid_color".
+    """
     for box in detections:
         x1, y1, x2, y2 = map(int, box)
         x1, y1, x2, y2 = (
@@ -120,9 +133,48 @@ def visualize(image: np.ndarray, detections: List[List[float]], scale_factor: fl
             min(image.shape[1], int(x2 * scale_factor)),
             min(image.shape[0], int(y2 * scale_factor)),
         )
-        image[y1:y2, x1:x2] = cv2.GaussianBlur(image[y1:y2, x1:x2], (51, 51), 0)
-    return image
 
+        # Extract the region to be anonymized
+        region = image[y1:y2, x1:x2]
+
+        if anonymization_type == "pixelation":
+            # Pixelation
+            pixelation_scale = 10
+            small_region = cv2.resize(region,
+                                      (region.shape[1] // pixelation_scale, region.shape[0] // pixelation_scale),
+                                      interpolation=cv2.INTER_LINEAR)
+            anonymized_region = cv2.resize(small_region, (region.shape[1], region.shape[0]),
+                                           interpolation=cv2.INTER_NEAREST)
+
+        elif anonymization_type == "blurring":
+            # Gaussian Blurring
+            anonymized_region = cv2.GaussianBlur(region, (51, 51), 0)
+
+        elif anonymization_type == "blackout":
+            # Blackout
+            anonymized_region = np.zeros_like(region)
+
+        elif anonymization_type == "mosaic":
+            # Mosaic Effect
+            block_size = 20
+            for y in range(0, region.shape[0], block_size):
+                for x in range(0, region.shape[1], block_size):
+                    block = region[y:y + block_size, x:x + block_size]
+                    color = block.mean(axis=(0, 1)).astype(int)  # Average color of the block
+                    region[y:y + block_size, x:x + block_size] = color
+            anonymized_region = region
+
+        elif anonymization_type == "solid_color":
+            # Solid Color Fill (e.g., red)
+            anonymized_region = np.full_like(region, fill_value=(0, 0, 255))  # Red color in BGR
+
+        else:
+            raise ValueError(f"Invalid anonymization type: {anonymization_type}")
+
+        # Replace the region in the original image
+        image[y1:y2, x1:x2] = anonymized_region
+
+    return image
 
 @profile_visualization
 def process_video(
