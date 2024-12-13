@@ -11,60 +11,63 @@ volume = Volume.from_name("your-volume-name")
 
 
 @app.function(volumes={"/data": volume}, schedule=Period(hours=1))
-def cleanup_old_files():
+def cleanup_old_files(retention_hours: int = 1, target_dir: str = "/data"):
     """
-    Deletes files older than 1 hour from the specified Modal volume.
-    Logs a summary of the cleanup process, including the total space freed.
+    Deletes files older than the specified retention period
     """
     try:
         # Calculate the cutoff time
-        cutoff_time = datetime.now() - timedelta(hours=1)
-        logger.info(f"Starting cleanup for files older than {cutoff_time}")
+        cutoff_time = datetime.now() - timedelta(hours=retention_hours)
 
         deleted_files = []
         retained_files = []
+        errors = []
 
-        # Iterate over files in the volume
-        for filename in os.listdir("/data"):
-            file_path = os.path.join("/data", filename)
+        # Ensure the target directory exists
+        if not os.path.exists(target_dir):
+            return {"status": "no_target_dir", "target_dir": target_dir}
 
-            if os.path.isfile(file_path):  # Ensure the item is a file
-                file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+        # Iterate over files in the directory
+        for filename in os.listdir(target_dir):
+            file_path = os.path.join(target_dir, filename)
 
-                if file_mtime < cutoff_time:
-                    try:
-                        file_size = os.path.getsize(file_path)
-                        os.remove(file_path)  # Delete the file
-                        deleted_files.append((filename, file_size))
-                    except Exception as e:
-                        logger.error(f"Error deleting file {filename}: {e}")
-                else:
-                    retained_files.append(filename)
+            try:
+                if os.path.isfile(file_path):  # Ensure the item is a file
+                    file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
 
-        # Log the results
+                    if file_mtime < cutoff_time:
+                        try:
+                            file_size = os.path.getsize(file_path)
+                            os.remove(file_path)  # Delete the file
+                            deleted_files.append((filename, file_size))
+                        except Exception as e:
+                            errors.append((filename, str(e)))
+                    else:
+                        retained_files.append(filename)
+            except Exception as e:
+                errors.append((filename, str(e)))
+
+        # Calculate the total space freed
         total_space_freed = sum(size for _, size in deleted_files)
-        logger.info(f"Deleted {len(deleted_files)} files, freeing {total_space_freed / 1024 / 1024:.2f} MB")
-        logger.info(f"Retained {len(retained_files)} files")
 
-        # Summary output
+        # Return a summary
         summary = {
             "timestamp": datetime.now().isoformat(),
             "cutoff_time": cutoff_time.isoformat(),
             "deleted_count": len(deleted_files),
             "retained_count": len(retained_files),
             "space_freed_mb": round(total_space_freed / 1024 / 1024, 2),
+            "errors": len(errors),
         }
-
-        logger.info("Cleanup Summary:")
-        for key, value in summary.items():
-            logger.info(f"{key}: {value}")
 
         return summary
 
     except Exception as e:
-        logger.error(f"Cleanup process failed: {e}")
-        raise
+        raise RuntimeError(f"Cleanup process failed: {e}")
 
-
-if __name__ == "__main__":
-    app.run()
+    if __name__ == "__main__":
+        # Run the cleanup with custom retention and target directory for experimentation
+        test_retention_hours = 2  # Delete files older than 2 hours
+        test_target_dir = "/data"  # Target directory for cleanup
+        result = cleanup_old_files(test_retention_hours, test_target_dir)
+        print("Cleanup Result:", result)
