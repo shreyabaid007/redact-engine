@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseSettings, HttpUrl, validator
 from cryptography.fernet import Fernet
 import httpx
+import aiofiles
 
 # Configure logging without sensitive data
 logging.basicConfig(
@@ -175,11 +176,15 @@ async def get_video(video_id: str) -> StreamingResponse:
         logger.error(f"Error retrieving video: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-
-# Implement your video retrieval logic
 async def retrieve_video(video_id: str) -> Optional[bytes]:
-    """
-    Implement your video retrieval logic here
-    Returns video data or None if not found
-    """
-    pass
+    file_path = f"/videos/{video_id}.mp4"
+
+    try:
+        if not os.path.exists(file_path):
+            return None
+
+        async with aiofiles.open(file_path, "rb") as f:
+            return await f.read()
+    except Exception as e:
+        logger.error(f"Failed to retrieve video {video_id}: {e}")
+        return None
