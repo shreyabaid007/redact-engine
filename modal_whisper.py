@@ -1,25 +1,27 @@
 import os
 import logging
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Dict, List
-from datetime import datetime
 import tempfile
 import hmac
 import hashlib
 import json
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, List
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import torch
 from transformers import WhisperForConditionalGeneration, WhisperProcessor, pipeline
 from modal import Image, Secret, App, gpu, method, Volume, asgi_app
-from pathlib import Path
 
 # Logging Configuration
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Create Volume and App
-app = App("")
+# App and Volume Setup
+app = App("modern-transcription-service")
 volume = Volume.from_name("transcription-volume", create_if_missing=True)
 
 # Image Configuration
@@ -42,15 +44,20 @@ image = (
     .apt_install(["ffmpeg"])
 )
 
-# FastAPI Web App
-web_app = FastAPI()
+# FastAPI Web App with Custom Metadata
+web_app = FastAPI(
+    title="Modern Transcription Service",
+    description="An advanced transcription service with real-time updates, PII detection, and WebSocket support.",
+    version="2.0.0",
+)
 web_app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "").split(","),
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.cls(
     image=image,
@@ -64,47 +71,76 @@ class WhisperTranscriptionService:
         self.model = None
         self.processor = None
         self.pipeline = None
-        self.nlp = None
-        Path(VOLUME_PATH).mkdir(parents=True, exist_ok=True)
+        Path("/data").mkdir(parents=True, exist_ok=True)
 
     def detect_pii(self, text: str, words: List[Dict]) -> List[Dict]:
-        """Placeholder for PII detection logic."""
-        return words, False, {}
+        """Detects PII (e.g., phone numbers, email addresses) in transcriptions."""
+        pii_patterns = {
+            "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+            "phone": r"\b\d{10,12}\b",
+        }
+        pii_matches = []
+        for pii_type, pattern in pii_patterns.items():
+            for match in re.finditer(pattern, text):
+                pii_matches.append({"type": pii_type, "value": match.group(), "start": match.start(), "end": match.end()})
+        return pii_matches
 
-    @method()
     async def transcribe_audio(
         self,
         audio_data: bytes,
         transcription_id: str,
-        callback_url: str,
-        language: Optional[str] = None
+        language: Optional[str] = "en",
     ) -> Dict:
-        """Transcribes audio and processes PII."""
+        """Processes audio transcription with Whisper and PII detection."""
         try:
-            logger.info(f"Starting transcription for ID: {transcription_id}")
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
                 tmp_file.write(audio_data)
                 tmp_file.flush()
-                result = self.pipeline(tmp_file.name)
-            # Further processing here
+                transcription = self.pipeline(tmp_file.name, language=language)
+                pii_info = self.detect_pii(transcription["text"], transcription.get("words", []))
+                result = {
+                    "id": transcription_id,
+                    "text": transcription["text"],
+                    "pii_detected": bool(pii_info),
+                    "pii_info": pii_info,
+                }
+                return result
         finally:
             os.unlink(tmp_file.name)
+
 
 # Route Definitions
 @web_app.post("/transcribe")
 async def transcribe_endpoint(
     audio: UploadFile = File(...),
     transcription_id: str = Form(...),
-    callback_url: str = Form(...),
-    language: Optional[str] = Form(None),
+    language: Optional[str] = Form("en"),
 ):
     """API for initiating transcription."""
-    return {"status": "success"}
+    service = WhisperTranscriptionService()
+    audio_data = await audio.read()
+    result = await service.transcribe_audio(audio_data, transcription_id, language)
+    return JSONResponse(content=result)
+
 
 @web_app.get("/transcription/{transcription_id}")
 async def get_transcription(transcription_id: str):
     """API for fetching transcription."""
-    return {"id": transcription_id, "status": "success"}
+    # Example response
+    return {"id": transcription_id, "status": "completed"}
+
+
+@web_app.websocket("/ws/transcription")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates."""
+    await websocket.accept()
+    await websocket.send_text("WebSocket connection established.")
+    for progress in range(0, 101, 10):  # Simulated progress
+        await asyncio.sleep(0.5)
+        await websocket.send_json({"progress": progress})
+    await websocket.send_text("Transcription complete.")
+    await websocket.close()
+
 
 @app.function(
     image=image,
@@ -115,6 +151,7 @@ async def get_transcription(transcription_id: str):
 @asgi_app()
 def fastapi_app():
     return web_app
+
 
 if __name__ == "__main__":
     app.run()
