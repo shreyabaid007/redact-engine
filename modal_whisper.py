@@ -1,5 +1,6 @@
 import os
 import logging
+import sqlite3
 import tempfile
 import hmac
 import hashlib
@@ -13,8 +14,6 @@ from typing import Optional, Dict, List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 from transformers import WhisperForConditionalGeneration, WhisperProcessor, pipeline
 from modal import Image, Secret, App, gpu, method, Volume, asgi_app
 
@@ -22,12 +21,12 @@ from modal import Image, Secret, App, gpu, method, Volume, asgi_app
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# App and Volume Setup
-app = App("advanced-transcription-service")
-volume = Volume.from_name("transcription-volume", create_if_missing=True)
+# Database Path
+DB_PATH = "transcriptions.db"
 
-# Rate Limiter
-limiter = Limiter(key_func=get_remote_address)
+# App and Volume Setup
+app = App("enhanced-transcription-service")
+volume = Volume.from_name("transcription-volume", create_if_missing=True)
 
 # Image Configuration
 image = (
@@ -45,18 +44,16 @@ image = (
         "uvicorn",
         "httpx>=0.24.0",
         "spacy==3.7.2",
-        "slowapi",
     ])
     .apt_install(["ffmpeg"])
 )
 
-# FastAPI Web App with Middleware
+# FastAPI Web App
 web_app = FastAPI(
-    title="Advanced Transcription Service",
-    description="An advanced transcription service with PII detection, WebSocket support, and cloud storage integration.",
-    version="3.0.0",
+    title="Enhanced Transcription Service",
+    description="A powerful transcription service with database support, real-time processing, and batch uploads.",
+    version="4.0.0",
 )
-web_app.state.limiter = limiter
 web_app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
@@ -64,6 +61,24 @@ web_app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Database Initialization
+def init_db():
+    """Initialize SQLite database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS transcriptions (
+                id TEXT PRIMARY KEY,
+                text TEXT,
+                pii_detected BOOLEAN,
+                pii_info TEXT,
+                created_at TIMESTAMP
+            )
+        """)
+        conn.commit()
+
 
 @app.cls(
     image=image,
@@ -120,19 +135,56 @@ class WhisperTranscriptionService:
                     "pii_detected": bool(pii_info),
                     "pii_info": pii_info,
                 }
+
+                # Save result to database
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO transcriptions (id, text, pii_detected, pii_info, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (transcription_id, transcription["text"], bool(pii_info), json.dumps(pii_info), datetime.now()))
+                    conn.commit()
+
                 return result
         finally:
             os.unlink(tmp_file.name)
 
 
-# Standardized API Responses
-def api_response(status: str, message: str, data: Optional[Dict] = None) -> JSONResponse:
-    return JSONResponse(content={"status": status, "message": message, "data": data})
+# Real-Time WebSocket Support
+@web_app.websocket("/ws/transcription")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates."""
+    await websocket.accept()
+    transcription_id = "real_time_id"
+    try:
+        progress = 0
+        while progress < 100:
+            await asyncio.sleep(0.5)
+            progress += 20
+            await websocket.send_json({"event": "progress", "transcription_id": transcription_id, "progress": progress})
+        await websocket.send_json({"event": "completion", "transcription_id": transcription_id, "message": "Transcription complete"})
+    except Exception as e:
+        await websocket.send_json({"event": "error", "message": str(e)})
+    finally:
+        await websocket.close()
+
+
+# Batch Transcription Endpoint
+@web_app.post("/batch-transcribe")
+async def batch_transcribe(files: List[UploadFile] = File(...)):
+    """Handles batch audio file transcription."""
+    service = WhisperTranscriptionService()
+    results = []
+    for file in files:
+        audio_data = await file.read()
+        transcription_id = str(uuid.uuid4())
+        result = await service.transcribe_audio(audio_data, transcription_id)
+        results.append(result)
+    return {"status": "success", "message": "Batch transcription complete", "results": results}
 
 
 # Route Definitions
 @web_app.post("/transcribe")
-@limiter.limit("10/minute")  # Rate limit: 10 requests per minute per client
 async def transcribe_endpoint(
     audio: UploadFile = File(...),
     transcription_id: str = Form(...),
@@ -142,28 +194,7 @@ async def transcribe_endpoint(
     service = WhisperTranscriptionService()
     audio_data = await audio.read()
     result = await service.transcribe_audio(audio_data, transcription_id, language)
-    return api_response("success", "Transcription completed", result)
-
-
-@web_app.get("/transcription/{transcription_id}")
-async def get_transcription(transcription_id: str):
-    """API for fetching transcription."""
-    # Example response
-    return api_response("success", "Transcription retrieved", {"id": transcription_id, "status": "completed"})
-
-
-@web_app.websocket("/ws/transcription")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time updates."""
-    await websocket.accept()
-    await websocket.send_text("WebSocket connection established.")
-    progress = 0
-    while progress < 100:
-        await asyncio.sleep(0.5)
-        progress += 10
-        await websocket.send_json({"progress": progress})
-    await websocket.send_text("Transcription complete.")
-    await websocket.close()
+    return {"status": "success", "message": "Transcription completed", "data": result}
 
 
 @app.function(
@@ -178,4 +209,5 @@ def fastapi_app():
 
 
 if __name__ == "__main__":
+    init_db()
     app.run()
