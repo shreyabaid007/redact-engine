@@ -1,0 +1,7 @@
+torch
+torchvision
+moviepy==1.0.3
+numpy>=1.24.3
+opencv-python-headless==4.7.0.72
+fastapi
+python-multipart
